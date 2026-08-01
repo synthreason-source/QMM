@@ -31,7 +31,7 @@ def index_to_raw(x: int) -> int:
 assert 0 <= FREE_BITS <= 24, "keep FREE_BITS <= ~20-22 for this simulator to stay fast"
 
 # ── EXPONENTIAL MODEL CONFIG ──────────────────────────────────────────────────
-VALIDATE_EXP_MODEL = True
+VALIDATE_EXP_MODEL = False
 VALIDATE_DIFF_BITS = 18
 VALIDATE_TRIALS = 2000
 
