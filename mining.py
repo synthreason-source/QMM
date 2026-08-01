@@ -177,11 +177,23 @@ def index_to_nonce(x: int) -> int:
 
 assert index_to_nonce(GUARANTEED_INDEX) == winning_nonce
 
-def oracle_function(x: int) -> bool:
-    if CANDIDATE_SET is not None and x not in CANDIDATE_SET:
-        return False
-    return nonce_meets_difficulty(index_to_nonce(x))
+def empirical_hash(nonce: int):
+    payload = f"{BLOCK_HEADER}|nonce={nonce}".encode()
+    digest = hashlib.sha256(payload).digest()
 
+    h32 = int.from_bytes(digest[:4], "big")
+    lz = leading_zeros32(h32)
+
+    return {
+        "digest": digest,
+        "digest_hex": digest.hex(),
+        "leading_zero_bits": lz,
+        "valid": lz >= VALIDATE_DIFF_BITS
+    }
+
+def oracle_function(x):
+    nonce = index_to_nonce(x)
+    return empirical_hash(nonce)["valid"]
 # ── ORACLE ────────────────────────────────────────────────────────────────────
 def build_oracle(free_bits: int) -> tuple:
     dim = 2 ** free_bits
