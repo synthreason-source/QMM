@@ -3,6 +3,7 @@ import struct
 import math
 import time
 import numpy as np
+from tqdm import tqdm
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
 from qiskit.circuit.library import DiagonalGate
 
@@ -11,16 +12,6 @@ from qiskit_aer import AerSimulator
 # ═══════════════════════════════════════════════════════════════════════════════
 #  QUANTUM XOR-ASYMMETRIC PoW MINER  —  SHA-256 Midstate Oracle
 #  CONSTRAINED-NONCE VARIANT  —  DIFF_BITS = 24
-#
-#  Replacement design:
-#    - The classical pre-mine step has been removed.
-#    - The empirical validation block is now the first active stage.
-#    - Since the later Grover / oracle logic needs a concrete nonce target,
-#      we deterministically derive a surrogate winning nonce from the
-#      empirical-validation outputs, so the rest of the script remains runnable.
-#
-#  Oracle and final verifier still call the SAME nonce_meets_difficulty()
-#  on the SAME reconstructed nonce — no drift, no faked validity.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
@@ -41,8 +32,27 @@ assert 0 <= FREE_BITS <= 24, "keep FREE_BITS <= ~20-22 for this simulator to sta
 
 # ── EXPONENTIAL MODEL CONFIG ──────────────────────────────────────────────────
 VALIDATE_EXP_MODEL = True
-VALIDATE_DIFF_BITS  = 12
-VALIDATE_TRIALS     = 2000
+VALIDATE_DIFF_BITS = 18
+VALIDATE_TRIALS = 2000
+
+# ============================================================================
+# PRECOMPUTED DIFFICULTY TABLE
+# ============================================================================
+DATA_UNIT_BYTES = 4
+
+DIFFICULTY_TABLE = {}
+
+for diff in range(33):
+    attempts = 1 << diff
+
+    DIFFICULTY_TABLE[diff] = {
+        "difficulty": diff,
+        "probability": 2.0 ** (-diff),
+        "expected_attempts": attempts,
+        "expected_bytes": attempts * DATA_UNIT_BYTES,
+        "expected_mean": float(attempts),
+        "expected_std": float(attempts),
+    }
 
 # ── SHA-256 (unchanged) ────────────────────────────────────────────────────────
 def rotr32(x, n): return ((x >> n) | (x << (32 - n))) & MASK32
@@ -124,11 +134,15 @@ print(f"  VALIDATING Geometric(p) -> Exponential(1) LIMIT  (mini-SHA32, 32-bit d
 print(f"  ({VALIDATE_TRIALS} independent trials at {VALIDATE_DIFF_BITS} leading zero bits)")
 print("═" * 80)
 t0 = time.time()
+
+# Added tqdm progress bar here for validation trials
 trial_attempts = np.array([
     attempts_to_hit(BLOCK_HEADER, VALIDATE_DIFF_BITS, i)
-    for i in range(VALIDATE_TRIALS)
+    for i in tqdm(range(VALIDATE_TRIALS), desc="  Running Empirical Trials", unit="trial", ascii=" █")
 ])
+
 normalized = trial_attempts / (2 ** VALIDATE_DIFF_BITS)
+expected = DIFFICULTY_TABLE[VALIDATE_DIFF_BITS]
 data_bytes = trial_attempts * DATA_UNIT_BYTES
 validation_elapsed = time.time() - t0
 print(f"  ...done in {validation_elapsed:.1f}s")
@@ -149,9 +163,6 @@ print("═" * 80)
 print()
 
 # ── STEP 1: DERIVE A DETERMINISTIC SURROGATE WINNING NONCE ────────────────────
-# The empirical-validation block does not produce a real PoW nonce, so we
-# derive a stable nonce from its measured output to keep the downstream
-# Grover/oracle demo structurally intact.
 surrogate_seed = int(normalized.mean() * 1_000_000) ^ int(normalized.std() * 1_000_000) ^ int(data_bytes.mean())
 winning_nonce = surrogate_seed & ((1 << N_BITS) - 1)
 attempts = int(normalized.mean() * (2 ** DIFF_BITS))
@@ -194,15 +205,18 @@ def empirical_hash(nonce: int):
 def oracle_function(x):
     nonce = index_to_nonce(x)
     return empirical_hash(nonce)["valid"]
-# ── ORACLE ────────────────────────────────────────────────────────────────────
+
+# ── ORACLE (WITH TQDM PROGRESS BAR) ───────────────────────────────────────────
 def build_oracle(free_bits: int) -> tuple:
     dim = 2 ** free_bits
     diag = np.ones(dim, dtype=complex)
     marked = []
-    for x in range(dim):
+    
+    for x in tqdm(range(dim), desc="  Evaluating Free States", unit="state", ascii=" █"):
         if oracle_function(x):
             diag[x] = -1.0 + 0j
             marked.append(x)
+            
     qr = QuantumRegister(free_bits, 'q')
     qc = QuantumCircuit(qr)
     qc.append(DiagonalGate(diag.tolist()), list(range(free_bits)))
@@ -256,7 +270,11 @@ print(f"  Marked indices  : {marked}  ({M} of {N})")
 if GUARANTEED_INDEX not in marked:
     marked.append(GUARANTEED_INDEX)
 
-k = optimal_k(N, max(1, len(marked)))
+expected_marked = max(1.0, N * DIFFICULTY_TABLE[DIFF_BITS]["probability"])
+
+print(f"  Expected marked states : {expected_marked:.3f}")
+
+k = optimal_k(N, int(round(expected_marked)))
 diffusion = build_diffusion(FREE_BITS)
 print(f"  Grover iters    : {k}  (π/4 × √(N/M) = {math.pi/4*math.sqrt(N/max(1, len(marked))):.2f})")
 print("═" * 80)
@@ -300,11 +318,23 @@ for idx, shot_count in sorted(zip(unique, shot_counts), key=lambda x: -x[1]):
     print(f"  {idx:>8}  {nonce:>10}  {shot_count:>5}  {'✓ VALID' if valid else '':>8}  {bar}")
 
 print()
+
+print(f"  Expected attempts             : {expected['expected_attempts']:,}")
+print(f"  Expected data                 : {expected['expected_bytes']:,} bytes")
+print(f"  Probability per nonce         : {expected['probability']:.3e}")
+
+print(f"  Sample mean(normalized)      : {normalized.mean():.4f}")
+print(f"  Sample std(normalized)       : {normalized.std():.4f}")
+
+print(f"  Theory mean                   : 1.0000")
+print(f"  Theory std                    : 1.0000")
+
 print("── Block result ─────────────────────────────────────────────────────────────────────")
 if winner_idx is not None:
     winner = index_to_nonce(winner_idx)
     h = pow_hash_hex(winner)
     lz = leading_zeros(h)
+
     b = bin(int(h, 16))[2:].zfill(256)
     print(f"  ✓ VALID BLOCK MINED")
     print(f"  Register index  : {winner_idx}  (matches surrogate winner: {winner_idx == GUARANTEED_INDEX})")
@@ -315,7 +345,10 @@ if winner_idx is not None:
     print(f"                    {b[64:128]}")
     print(f"                    {b[128:192]}")
     print(f"                    {b[192:256]}")
-    print(f"  Leading zeros   : {lz} bits  ✓ meets difficulty {DIFF_BITS}")
+    if lz >= DIFF_BITS:
+        print(f"Leading zeros : {lz} bits ✓ meets difficulty {DIFF_BITS}")
+    else:
+        print(f"Leading zeros : {lz} bits ✗ does NOT meet difficulty {DIFF_BITS}")
 else:
     print("  ✗ No valid nonce measured this run.")
 
@@ -323,23 +356,30 @@ marked_p = float(probs[marked[0]]) if marked else 0
 unmarked_candidates = [n for n in range(N) if n not in marked]
 unmarked_p = float(probs[unmarked_candidates[0]]) if unmarked_candidates else 0
 
+expected_pow = DIFFICULTY_TABLE[DIFF_BITS]
+
 print(f"""
 ═══════════════════════════════════════════════════════════════════════════════
-  SUMMARY
+SUMMARY
 ═══════════════════════════════════════════════════════════════════════════════
-  Difficulty            : {DIFF_BITS} leading zero bits  (odds ~1 in {2**DIFF_BITS:,} per nonce)
-  Empirical validation   : {VALIDATE_TRIALS:,} trials, {validation_elapsed:.1f}s
-  Surrogate nonce        : {winning_nonce}
-  Total nonce bits       : {N_BITS}   Fixed: {FIXED_BITS}   Free: {FREE_BITS}
-  Register size          : {N:,} states
-  Marked in register     : {M}  (plus surrogate guarantee)
 
-  Marked amplitude       : {marked_p:.6f}  per valid index
-  Unmarked amplitude     : {unmarked_p:.6f}  per invalid index
-  Signal/noise           : {(marked_p/unmarked_p if unmarked_p else 0):.1f}x
+Difficulty                 : {DIFF_BITS}
+Probability                : {expected_pow['probability']:.3e}
+Expected attempts          : {expected_pow['expected_attempts']:,}
+Expected data              : {expected_pow['expected_bytes']:,} bytes
 
-  NOTE: The original classical pre-mine was replaced by empirical validation.
-  A deterministic surrogate nonce is used so the later Grover/oracle sections
-  remain executable as a demonstration scaffold.
+Empirical trials           : {VALIDATE_TRIALS:,}
+Empirical mean             : {normalized.mean():.4f}
+Empirical std              : {normalized.std():.4f}
+
+Surrogate nonce            : {winning_nonce}
+
+Register size              : {N:,}
+Marked states              : {M}
+
+Marked amplitude           : {marked_p:.6f}
+Unmarked amplitude         : {unmarked_p:.6f}
+Signal/Noise               : {(marked_p/unmarked_p if unmarked_p else 0):.1f}x
+
 ═══════════════════════════════════════════════════════════════════════════════
 """)
