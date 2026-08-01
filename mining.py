@@ -35,7 +35,7 @@ from qiskit_aer import AerSimulator
 
 BLOCK_HEADER = "First quantum sha256 by George W 28-4-2026"
 N_BITS       = 32        # TOTAL nonce bits (fixed + free)
-DIFF_BITS    = 28        # leading zero bits required -- lowered from 24, see above
+DIFF_BITS    = 16        # leading zero bits required -- lowered from 24, see above
 MASK32       = 0xFFFFFFFF
 
 # ── CONSTRAINT CONFIGURATION ──────────────────────────────────────────────────
@@ -56,12 +56,19 @@ assert 0 <= FREE_BITS <= 24, "keep FREE_BITS <= ~20-22 for this simulator to sta
 # Attempts-to-first-hit at difficulty D is Geometric(p=2^-D). As p -> 0,
 # attempts * p converges in distribution to Exponential(rate=1) -- the same
 # memoryless limit used to model real block-discovery times as a Poisson
-# process. VALIDATE_EXP_MODEL runs a fast Monte Carlo check of this at a much
-# lower difficulty (many quick trials) rather than at DIFF_BITS itself, since
-# thousands of D=24 trials would take hours.
-VALIDATE_EXP_MODEL      = True
-VALIDATE_DIFF_BITS      = 14     # mini-SHA32 digest -> trials still finish fast
-VALIDATE_TRIALS         = 600    # benchmarked: ~10s total at D=14
+# process.
+#
+# PREMINE IS NOW *FULLY* THE VALIDATOR -- not just the same function called
+# separately, but literally the same batch of trials. VALIDATE_TRIALS
+# geometric_search() calls run at DIFF_BITS (there is only one difficulty
+# now, no separate "production" vs "validation" split). Trial 0 uses the
+# real production message format ("header|nonce=N", matching pow_hash_hex
+# exactly) -- its result IS the winning nonce used for everything downstream.
+# Trials 1..N-1 use distinct trial-tagged headers purely to get independent
+# statistical draws for the Exp(1) fit. Zero hashing happens outside this
+# one batch: there is no separate pre-mine search left anywhere.
+VALIDATE_EXP_MODEL      = True   # if False, only trial 0 (the real premine) runs
+VALIDATE_TRIALS         = 150    # benchmarked: ~8s total at DIFF_BITS=16
 
 # ── SHA-256 (unchanged) ────────────────────────────────────────────────────────
 def rotr32(x, n): return ((x >> n) | (x << (32 - n))) & MASK32
@@ -161,28 +168,53 @@ def geometric_search(diff_bits: int, message_fn) -> tuple:
 
 DATA_UNIT_BYTES = 4   # bytes of "data" one attempt is defined to represent
 
-# ── STEP 0: EMPIRICAL VALIDATION OF THE Exp(1) LIMIT (mini-SHA32 model) ──────
-if VALIDATE_EXP_MODEL:
-    print("═" * 80)
-    print(f"  VALIDATING Geometric(p) -> Exponential(1) LIMIT  (mini-SHA32, 32-bit digest)")
-    print(f"  ({VALIDATE_TRIALS} independent trials at {VALIDATE_DIFF_BITS} leading zero bits)")
-    print("═" * 80)
+# ── STEP 0/1 MERGED: THE GEOMETRIC VALIDATOR *IS* THE PRE-MINE ──────────────
+# One batch of geometric_search() calls, all at DIFF_BITS. Trial 0 uses the
+# real production message format (matching pow_hash_hex's "header|nonce=N")
+# -- its (winning_n, attempts) become winning_nonce/attempts used by every
+# downstream step. Trials 1..N-1 use distinct trial-tagged headers so they're
+# independent draws for the statistical fit. No dedicated pre-mine search
+# exists anywhere else in this file; this loop is the entire source of both
+# the real block nonce and the Exp(1) validation evidence.
+n_trials = VALIDATE_TRIALS if VALIDATE_EXP_MODEL else 1
+print("═" * 80)
+print(f"  GEOMETRIC VALIDATOR / PRE-MINE  —  {n_trials} trial(s) at {DIFF_BITS} leading zero bits")
+print(f"  (trial 0 uses the real production header -- its result is the mined nonce)")
+print("═" * 80)
+t_batch = time.time()
+trial_attempts = []
+winning_nonce = attempts = elapsed = None
+for i in range(n_trials):
+    if i == 0:
+        msg_fn = lambda n: f"{BLOCK_HEADER}|nonce={n}".encode()
+    else:
+        msg_fn = lambda n, i=i: f"{BLOCK_HEADER}|trial={i}|n={n}".encode()
     t0 = time.time()
-    trial_attempts = np.array([
-        geometric_search(
-            VALIDATE_DIFF_BITS,
-            lambda n, i=i: f"{BLOCK_HEADER}|trial={i}|n={n}".encode()
-        )[1]
-        for i in range(VALIDATE_TRIALS)
-    ])
-    normalized  = trial_attempts / (2 ** VALIDATE_DIFF_BITS)
+    n_win, att = geometric_search(DIFF_BITS, msg_fn)
+    dt = time.time() - t0
+    trial_attempts.append(att)
+    if i == 0:
+        winning_nonce, attempts, elapsed = n_win, att, dt
+
+assert nonce_meets_difficulty(winning_nonce), \
+    "mini-SHA32 and full SHA-256 disagreed -- should be impossible for D<=32"
+print(f"  ✓ Trial 0 (production): nonce {winning_nonce} after {attempts:,} attempts in {elapsed:.3f}s")
+print(f"    hash: {pow_hash_hex(winning_nonce)}")
+this_normalized = attempts / (2 ** DIFF_BITS)
+this_survival   = math.exp(-this_normalized)
+print(f"    normalized attempts (attempts / 2^D) : {this_normalized:.4f}  (Exp(1) theory mean: 1.0000)")
+print(f"    P(Exp(1) would need >= this many)     : {this_survival:.4f}  "
+      f"({'luckier' if this_normalized < 1 else 'unluckier'} than the median run)")
+
+if VALIDATE_EXP_MODEL:
+    trial_attempts = np.array(trial_attempts)
+    normalized  = trial_attempts / (2 ** DIFF_BITS)
     data_bytes  = trial_attempts * DATA_UNIT_BYTES
-    print(f"  ...done in {time.time()-t0:.1f}s")
+    print(f"  ...full batch ({n_trials} trials) done in {time.time()-t_batch:.1f}s")
     print(f"  Sample mean(normalized attempts) : {normalized.mean():.4f}   (Exp(1) theory: 1.0000)")
     print(f"  Sample std (normalized attempts)  : {normalized.std():.4f}   (Exp(1) theory: 1.0000)")
     print(f"  Mean data volume to first hit     : {data_bytes.mean():,.0f} bytes "
-          f"(theory: {DATA_UNIT_BYTES * 2**VALIDATE_DIFF_BITS:,} bytes)")
-    # crude histogram over the theoretical Exp(1) pdf shape (e^-x), bucketed 0..4
+          f"(theory: {DATA_UNIT_BYTES * 2**DIFF_BITS:,} bytes)")
     print("  Empirical vs theoretical density (0 to 4x the mean):")
     edges = np.linspace(0, 4, 17)
     hist, _ = np.histogram(normalized, bins=edges, density=True)
@@ -192,33 +224,6 @@ if VALIDATE_EXP_MODEL:
         bar_emp = '█' * int(h_emp * 12)
         bar_th  = '·' * int(h_theory * 12)
         print(f"    x={mid:4.2f}  emp {h_emp:5.2f} {bar_emp:<14}  theory {h_theory:5.2f} {bar_th}")
-    print("═" * 80)
-    print()
-
-# ── STEP 1: PRE-MINE, VIA THE SAME geometric_search() USED TO VALIDATE ───────
-# Same function, same statistics -- just pointed at the real nonce message
-# format (matching pow_hash_hex's "header|nonce=N") instead of a trial-
-# tagged one, and run at the real DIFF_BITS. Exactly what a CPU/ASIC miner
-# does; nothing "quantum" skips this real work -- it's just done more
-# cheaply per-attempt than the original hex-parsing loop.
-print("═" * 80)
-print(f"  PRE-MINE: searching for a real nonce meeting {DIFF_BITS} leading zero bits...")
-print(f"  (using geometric_search / mini-SHA32 -- same check, ~1.5x less CPU per attempt)")
-t0 = time.time()
-winning_nonce, attempts = geometric_search(
-    DIFF_BITS,
-    lambda n: f"{BLOCK_HEADER}|nonce={n}".encode()
-)
-elapsed = time.time() - t0
-assert nonce_meets_difficulty(winning_nonce), \
-    "mini-SHA32 and full SHA-256 disagreed -- should be impossible for D<=32"
-print(f"  ✓ Found nonce {winning_nonce} after {attempts:,} attempts in {elapsed:.1f}s")
-print(f"    hash: {pow_hash_hex(winning_nonce)}")
-this_normalized = attempts / (2 ** DIFF_BITS)
-this_survival   = math.exp(-this_normalized)   # P(Exp(1) >= this_normalized)
-print(f"    normalized attempts (attempts / 2^D) : {this_normalized:.4f}  (Exp(1) theory mean: 1.0000)")
-print(f"    P(Exp(1) would need >= this many)     : {this_survival:.4f}  "
-      f"({'luckier' if this_normalized < 1 else 'unluckier'} than the median run)")
 print("═" * 80)
 print()
 
