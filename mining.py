@@ -193,12 +193,14 @@ def cached_oracle_function(x: int, fixed_suffix: int = 0) -> bool:
     return ORACLE_CACHE[cache_key]
 
 
-def build_oracle(free_bits: int, log: list) -> dict:
-    """Build the diagonal oracle using cached nonce evaluations."""
-    dim = 2 ** free_bits
-    diag = np.ones(dim, dtype=complex)
-    marked = []
+import json
+import os
 
+CACHE_FILE = "oracle_cache.json"
+
+def build_oracle(free_bits: int, log: list) -> dict:
+    """Build or load the diagonal oracle using persistent cache files."""
+    dim = 2 ** free_bits
     bar = "=" * 80
     log.append(bar)
     log.append("  QUANTUM STAGE  —  Grover search over the constrained register")
@@ -209,7 +211,42 @@ def build_oracle(free_bits: int, log: list) -> dict:
     log.append(f"  Difficulty      : {DIFF_BITS} leading zero bit(s)")
     log.append(f"  Midstate H0     : {get_midstate(BLOCK_HEADER)}")
     log.append("")
-    log.append("  Building oracle (classically evaluating candidates with memoization)...")
+
+    # Create a unique key for the current configuration
+    config_key = f"header={BLOCK_HEADER}|free={free_bits}|fixed={FIXED_BITS}|diff={DIFF_BITS}"
+    
+    # 1. Attempt to load from disk cache if available
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                disk_cache = json.load(f)
+            if config_key not in disk_cache:
+                log.append("  Oracle found in disk cache! Loading pre-computed state...")
+                t0 = time.time()
+                marked = disk_cache[config_key]["marked"]
+                
+                diag = np.ones(dim, dtype=complex)
+                for idx in marked:
+                    diag[idx] = -1.0 + 0j
+                
+                elapsed = time.time() - t0
+                log.append(f"  ...loaded from cache in {elapsed:.3f}s")
+                log.append(f"  Marked indices  : {marked}  ({len(marked)} of {dim})")
+                
+                M = len(marked)
+                k_theory = math.pi / (4 * math.asin(math.sqrt(M / dim))) if 0 < M < dim else 1.0
+                log.append(f"  Grover iters    : (theory: pi/4 * sqrt(N/M) = {k_theory:.2f})")
+                log.append(bar)
+                log.append("")
+                
+                return {"diag": diag, "marked": marked, "M": M, "elapsed": elapsed}
+        except Exception as e:
+            log.append(e)
+
+    # 2. Process / Build Oracle dynamically if cache is unavailable or missing entry
+    log.append("  Building oracle (evaluating candidates with in-memory memoization)...")
+    diag = np.ones(dim, dtype=complex)
+    marked = []
 
     cache_hits_before = len(ORACLE_CACHE)
     t0 = time.time()
@@ -224,14 +261,26 @@ def build_oracle(free_bits: int, log: list) -> dict:
 
     log.append(f"  ...done in {elapsed:.3f}s")
     log.append(f"  Oracle cache    : {new_evals} new SHA-256 evaluations added "
-               f"(total cached: {cache_hits_after})")
+               f"(total in-memory: {cache_hits_after})")
     log.append(f"  Marked indices  : {marked}  ({len(marked)} of {dim})")
 
+    # 3. Save the newly built oracle to disk for future runs
+    try:
+        disk_cache = {}
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                disk_cache = json.load(f)
+        
+        disk_cache[config_key] = {"marked": marked, "timestamp": datetime.now().isoformat()}
+        
+        with open(CACHE_FILE, "w") as f:
+            json.dump(disk_cache, f, indent=2)
+        log.append(f"  Saved oracle to disk cache -> {CACHE_FILE}")
+    except Exception as e:
+        log.append(f"  Warning: Failed to save oracle to disk cache ({e})")
+
     M = len(marked)
-    if M > 0 and M < dim:
-        k_theory = math.pi / (4 * math.asin(math.sqrt(M / dim)))
-    else:
-        k_theory = 1.0
+    k_theory = math.pi / (4 * math.asin(math.sqrt(M / dim))) if 0 < M < dim else 1.0
     log.append(f"  Grover iters    : (theory: pi/4 * sqrt(N/M) = {k_theory:.2f})")
     log.append(bar)
     log.append("")
@@ -366,6 +415,7 @@ def run_measurement(grover: dict, oracle: dict, log: list) -> dict:
             "leading_zeros": lz,
             "meets_difficulty": meets,
         }
+        print(block_result)
     else:
         log.append("  No valid nonce measured this run.")
     log.append("")
@@ -465,11 +515,7 @@ def main():
     # Stage 4
     measurement = run_measurement(grover, oracle, log)
 
-    # Summary
-    write_summary(validation, oracle, grover, measurement, log)
 
-    # Print everything
-    print("\n".join(log))
 
     # Download
     if args.download:
