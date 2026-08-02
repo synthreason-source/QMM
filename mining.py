@@ -42,7 +42,7 @@ except ImportError:
 
 BLOCK_HEADER = "First quantum sha256 by George W 8-2-2026"
 N_BITS = 32          # total nonce width
-DIFF_BITS = 10       # number of leading zero bits required in SHA-256
+DIFF_BITS = 17       # number of leading zero bits required in SHA-256
 FIXED_BITS = 16      # low bits of the nonce that stay fixed (constrained register)
 FREE_BITS = N_BITS - FIXED_BITS
 
@@ -415,6 +415,7 @@ def run_measurement(grover: dict, oracle: dict, log: list) -> dict:
             "leading_zeros": lz,
             "meets_difficulty": meets,
         }
+        print(BLOCK_HEADER)
         print(block_result)
     else:
         log.append("  No valid nonce measured this run.")
